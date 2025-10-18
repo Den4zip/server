@@ -1,53 +1,81 @@
-# --- START OF FILE gee_initializer.py ---
-
-import os
+# --- START OF FILE gigachat_service.py ---
 import json
-import ee
 import logging
+from gigachat import GigaChat
+from gigachat.models import Chat, Messages, MessagesRole
 
 logger = logging.getLogger(__name__)
 
-class GEEInitializer:
-    _initialized = False
-    
-    @classmethod
-    def initialize_gee(cls, service_account_key_path: str = "hack25addcode-3171f61bba2c.json"):
-        """
-        Инициализирует Google Earth Engine. Гарантирует однократную инициализацию.
-        """
-        if cls._initialized:
-            logger.debug("GEE уже инициализирован")
-            return True
-            
+class GigaChatService:
+    def __init__(self, config_path="hack25addcode-3171f61bba2c.json"):
+        self.api_key = self._load_api_key(config_path)
+        if not self.api_key:
+            logger.error("Ключ API GigaChat не найден в config.json. Рекомендации AI не будут работать.")
+            self.giga = None
+        else:
+            # verify_ssl_certs=False может понадобиться в некоторых окружениях
+            self.giga = GigaChat(credentials=self.api_key, verify_ssl_certs=False)
+
+    def _load_api_key(self, config_path):
         try:
-            if service_account_key_path and os.path.exists(service_account_key_path):
-                logger.info(f"Инициализация GEE с сервисным аккаунтом: {service_account_key_path}")
-                with open(service_account_key_path) as f:
-                    credentials_info = json.load(f)
-                service_account_email = credentials_info['client_email']
-                credentials = ee.ServiceAccountCredentials(service_account_email, service_account_key_path)
-                ee.Initialize(credentials=credentials)
-            else:
-                logger.info("Инициализация GEE с учетными данными по умолчанию")
-                ee.Initialize()
-            
-            cls._initialized = True
-            logger.info("GEE успешно инициализирован")
-            return True
-            
-        except ee.EEException as e:
-            if 'already been initialized' in str(e).lower():
-                cls._initialized = True
-                logger.info("GEE уже был инициализирован ранее")
-                return True
-            else:
-                logger.error(f"Ошибка инициализации Earth Engine: {e}")
-                raise ConnectionError(f"Ошибка инициализации Earth Engine: {e}")
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                return config.get("GIGACHAT_API_KEY")
+        except FileNotFoundError:
+            logger.warning(f"Файл конфигурации {config_path} не найден.")
+            return None
+        except json.JSONDecodeError:
+            logger.error(f"Ошибка парсинга файла {config_path}.")
+            return None
+
+    # <<< --- НАЧАЛО ИСПРАВЛЕНИЙ --- >>>
+    async def get_recommendations(self, index_stats: dict) -> str:
+        """
+        Получает агрономические рекомендации от GigaChat на основе средних значений нескольких вегетационных индексов.
+        """
+        if not self.giga:
+            return "Сервис AI-рекомендаций недоступен из-за отсутствия API ключа."
+
+        # Формируем строку с данными для промпта
+        stats_string = "\n".join([f"- {name.upper()}: {value:.3f}" for name, value in index_stats.items()])
+
+        prompt = f"""
+        Ты — ведущий агроном-аналитик, специализирующийся на данных дистанционного зондирования. Тебе предоставлены средние значения нескольких вегетационных индексов для сельскохозяйственного поля.
+
+        СПРАВКА ПО ИНДЕКСАМ:
+        - NDVI (Normalized Difference Vegetation Index): Основной показатель здоровья и густоты растительности. Высокие значения (ближе к 1) - хорошо.
+        - SAVI (Soil-Adjusted Vegetation Index): Модификация NDVI, которая минимизирует влияние яркости почвы. Особенно полезен на ранних стадиях роста, когда почва видна.
+        - EVI (Enhanced Vegetation Index): Улучшенный индекс, более чувствительный в областях с очень густой растительностью (где NDVI "насыщается") и менее подвержен атмосферным помехам.
+        - VARI (Visible Atmospherically Resistant Index): Индекс, использующий только видимые каналы (RGB). Менее точен, чем индексы с NIR-каналом, но хорошо показывает неоднородность поля и устойчив к атмосферным искажениям.
+
+        ДАННЫЕ АНАЛИЗА:
+        {stats_string}
+
+        ТВОЯ ЗАДАЧА:
+        1. Проведи комплексный анализ, сравнивая значения индексов между собой. Например, что может означать высокий NDVI, но относительно низкий SAVI? Или как EVI дополняет картину NDVI?
+        2. Дай общую оценку состояния посевов на основе всех данных.
+        3. Сформируй 3-4 конкретные, действенные рекомендации для агронома в виде маркированного списка. Рекомендации должны учитывать нюансы, которые видны из сравнения индексов.
+        4. Ответ должен быть структурированным, лаконичным и профессиональным. Не используй приветствия.
+        """
+        
+        payload = Chat(
+            messages=[
+                Messages(
+                    role=MessagesRole.USER,
+                    content=prompt
+                )
+            ],
+            temperature=0.7,
+        )
+
+        try:
+            logger.info(f"Отправка запроса в GigaChat с данными: {index_stats}")
+            # ИСПРАВЛЕНИЕ: Убран 'async with'. Вызываем achat напрямую.
+            response = await self.giga.achat(payload)
+            recommendation = response.choices[0].message.content
+            logger.info("Ответ от GigaChat успешно получен.")
+            return recommendation
         except Exception as e:
-            logger.error(f"Неожиданная ошибка при инициализации Earth Engine: {e}")
-            raise ConnectionError(f"Неожиданная ошибка при инициализации Earth Engine: {e}")
-    
-    @classmethod
-    def is_initialized(cls):
-        """Проверяет, инициализирован ли GEE"""
-        return cls._initialized
+            logger.error(f"Ошибка при взаимодействии с API GigaChat: {e}")
+            return f"Не удалось получить AI-рекомендации. Ошибка: {e}"
+    # <<< --- КОНЕЦ ИСПРАВЛЕНИЙ --- >>>

@@ -1,395 +1,267 @@
-# --- START OF FILE analysis_manager.py ---
-
-import json
-import time
+import uvicorn
+from dbrequest import DatabaseManager
+import subprocess
+import controller_func
+import signal
+import socket
 import logging
-from typing import Dict, List, Optional
-from ImageProvider import ImageProvider
-from index_calculator import VegetationIndexCalculator
-from gee_initializer import GEEInitializer
-import numpy as np
-import base64
-from io import BytesIO
-from PIL import Image
-import ee
-import cv2
+from fastapi import FastAPI, Query, APIRouter
+from fastapi.staticfiles import StaticFiles
+import time
+import os
+import pathlib
+from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger(__name__)
 
-class AnalysisManager:
-    """
-    Класс-оркестратор для выполнения анализа спутниковых снимков.
-    Отвечает за получение данных, вычисление индексов, генерацию изображений
-    и сохранение результатов в базу данных.
-    """
-    def __init__(self, db_manager):
-        self.db = db_manager
+class controller():
+    def __init__(self, port, use_https=True, token_use=True):
+        logger.info("Инициализация контроллера...")
+        self.use_https = use_https
+        self.token_use = token_use
+        self.ssl_keyfile = None
+        self.ssl_certfile = None
 
-    # --- Методы для работы с данными пользователя в БД ---
+        protocol = "https" if self.use_https else "http"
 
-    def _get_user_data_object(self, token: str) -> dict:
-        """Вспомогательная функция для получения и парсинга данных пользователя."""
-        data_str = self.db.get_user_data(token)
-        if data_str:
-            try:
-                data_obj = json.loads(data_str)
-                if 'analyses' not in data_obj: data_obj['analyses'] = []
-                if 'saved_fields' not in data_obj: data_obj['saved_fields'] = []
-                return data_obj
-            except json.JSONDecodeError:
-                logger.warning(f"Не удалось распарсить JSON для токена {token}. Возвращаем пустую структуру.")
-                return {'analyses': [], 'saved_fields': []}
-        return {'analyses': [], 'saved_fields': []}
+        if self.use_https:
+            self.ssl_keyfile = pathlib.Path("key.pem")
+            self.ssl_certfile = pathlib.Path("cert.pem")
+            self._setup_ssl()
 
-    def _save_user_data_object(self, token: str, data_obj: dict) -> bool:
-        """Вспомогательная функция для сохранения объекта данных пользователя."""
-        try:
-            data_str = json.dumps(data_obj)
-            return self.db.save_user_data(token, data_str)
-        except Exception as e:
-            logger.error(f"Ошибка при сериализации и сохранении данных для токена {token}: {e}")
-            return False
+        ip = self.get_local_ip()
+        print(f"Сервер будет доступен по адресам ({protocol.upper()}):")
+        print(f"Локально: {protocol}://localhost:80")
+        print(f"В сети: {protocol}://{ip}:80")
+        if not self.use_https:
+            print("\nВНИМАНИЕ: Сервер запущен в небезопасном режиме HTTP.")
+            print("Для производственного использования рекомендуется HTTPS.\n")
+        print("Для остановки сервера нажмите Ctrl+C")
 
-    # --- Методы для вычислений и обработки ---
+        self._kill_process_on_port(port)
+        self.app = FastAPI()
 
-    def _calculate_zones(self, index_map: np.ndarray, thresholds: Dict[str, List[float]]) -> Dict:
-        """Разделяет карту индекса на зоны и вычисляет их процентное соотношение."""
-        total_pixels = np.count_nonzero(~np.isnan(index_map))
-        if total_pixels == 0:
-            return {'low': 0, 'medium': 0, 'high': 0}
-            
-        zones = {}
-        for zone_name, (lower, upper) in thresholds.items():
-            mask = (index_map >= lower) & (index_map < upper)
-            pixel_count = np.count_nonzero(mask)
-            zones[zone_name] = round((pixel_count / total_pixels) * 100, 2)
-            
-        return zones
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        self.db = DatabaseManager()
+        self.func = controller_func.controller_func(self.db)
 
-    def _calculate_all_indices(self, calculator: VegetationIndexCalculator) -> Dict:
-        """Вычисляет все вегетационные индексы и их статистику на основе калькулятора."""
-        indices_data = {}
+        logger.info("Контроллер инициализирован")
+
+    def _setup_ssl(self):
+        logger.info("Проверка SSL-сертификатов...")
+        if self.ssl_keyfile.exists() and self.ssl_certfile.exists():
+            logger.info("Найдены существующие SSL-сертификаты. Используются они.")
+            print("Найдены существующие SSL-сертификаты (key.pem, cert.pem).")
+            return
+
+        logger.warning("SSL-сертификаты не найдены. Генерация самоподписанных сертификатов...")
+        print("\nВНИМАНИЕ: SSL-сертификаты не найдены.")
+        print("Генерируются самоподписанные сертификаты (key.pem, cert.pem).")
+        print("Браузер будет выдавать предупреждение о безопасности, это нормально для самоподписанных сертификатов.")
         
-        # NDVI
-        ndvi_map = calculator.calculate_ndvi()
-        ndvi_stats = {'min': float(np.nanmin(ndvi_map)), 'max': float(np.nanmax(ndvi_map)), 'mean': float(np.nanmean(ndvi_map)), 'std': float(np.nanstd(ndvi_map))}
-        ndvi_zones = self._calculate_zones(ndvi_map, {'low': [-1, 0.2], 'medium': [0.2, 0.5], 'high': [0.5, 1.01]})
-        indices_data['ndvi'] = {'map': ndvi_map, 'stats': ndvi_stats, 'zones': ndvi_zones}
-        
-        # SAVI
-        savi_map = calculator.calculate_savi()
-        savi_stats = {'min': float(np.nanmin(savi_map)), 'max': float(np.nanmax(savi_map)), 'mean': float(np.nanmean(savi_map)), 'std': float(np.nanstd(savi_map))}
-        indices_data['savi'] = {'map': savi_map, 'stats': savi_stats}
-
-        # VARI
-        vari_map = calculator.calculate_vari()
-        vari_stats = {'min': float(np.nanmin(vari_map)), 'max': float(np.nanmax(vari_map)), 'mean': float(np.nanmean(vari_map)), 'std': float(np.nanstd(vari_map))}
-        indices_data['vari'] = {'map': vari_map, 'stats': vari_stats}
-        
-        # EVI
-        evi_map = calculator.calculate_evi()
-        evi_stats = {'min': float(np.nanmin(evi_map)), 'max': float(np.nanmax(evi_map)), 'mean': float(np.nanmean(evi_map)), 'std': float(np.nanstd(evi_map))}
-        indices_data['evi'] = {'map': evi_map, 'stats': evi_stats}
-        
-        return indices_data
-    
-    # --- Методы для генерации изображений ---
-
-    def _array_to_base64(self, array: np.ndarray) -> str:
-        """Конвертирует numpy array (карту индекса) в серую base64 строку для отчета."""
         try:
-            array_min = np.nanmin(array)
-            array_max = np.nanmax(array)
-            if array_max > array_min:
-                normalized = (255 * (array - array_min) / (array_max - array_min))
-            else:
-                normalized = np.zeros_like(array)
-
-            normalized[np.isnan(normalized)] = 0
-            normalized = normalized.astype(np.uint8)
-                
-            image = Image.fromarray(normalized, mode='L').convert('RGB')
-            buffered = BytesIO()
-            image.save(buffered, format="JPEG")
-            return base64.b64encode(buffered.getvalue()).decode()
-        except Exception as e:
-            logger.error(f"Ошибка конвертации массива в base64: {e}")
-            return ""
-
-    def _rgb_array_to_base64(self, rgb_array: np.ndarray) -> str:
-        """Конвертирует цветной RGB numpy array в base64 строку."""
-        try:
-            image = Image.fromarray(rgb_array.astype(np.uint8), mode='RGB')
-            buffered = BytesIO()
-            image.save(buffered, format="JPEG")
-            return base64.b64encode(buffered.getvalue()).decode()
-        except Exception as e:
-            logger.error(f"Ошибка конвертации RGB массива в base64: {e}")
-            return ""
-
-    def _colorize_ndvi(self, ndvi_map: np.ndarray) -> str:
-        """
-        Принимает карту NDVI (значения от -1 до 1) и возвращает
-        цветное PNG изображение в формате base64 с альфа-каналом для оверлея.
-        """
-        try:
-            ndvi_map_clipped = np.clip(ndvi_map, 0, 1)
-            normalized = (ndvi_map_clipped * 255).astype(np.uint8)
-            mask_nan = np.isnan(ndvi_map)
-
-            # Создаем кастомную цветовую карту Red -> Yellow -> Green
-            lut = np.zeros((256, 1, 3), dtype=np.uint8)
-            for i in range(256):
-                if i < 128:
-                    lut[i, 0, 0] = 0 # Blue
-                    lut[i, 0, 1] = i * 2 # Green
-                    lut[i, 0, 2] = 255 # Red
-                else:
-                    lut[i, 0, 0] = 0 # Blue
-                    lut[i, 0, 1] = 255 # Green
-                    lut[i, 0, 2] = 255 - (i - 128) * 2 # Red
-            
-            colored_bgr = cv2.LUT(cv2.cvtColor(normalized, cv2.COLOR_GRAY2BGR), lut)
-            bgra = cv2.cvtColor(colored_bgr, cv2.COLOR_BGR2BGRA)
-
-            # Устанавливаем прозрачность для NaN значений
-            bgra[:, :, 3] = 255
-            bgra[mask_nan, 3] = 0
-
-            _, buffer = cv2.imencode('.png', bgra)
-            return base64.b64encode(buffer).decode('utf-8')
-
-        except Exception as e:
-            logger.error(f"Ошибка при раскрашивании NDVI: {e}")
-            return ""
-
-    def _create_problem_zones_image(self, rgb_image: np.ndarray, ndvi_map: np.ndarray, threshold: float = 0.2) -> str:
-        """
-        Подсвечивает проблемные зоны (NDVI < threshold) красным цветом
-        на сером фоне оригинального снимка для отчета.
-        """
-        try:
-            # Получаем целевые размеры из RGB-изображения
-            h, w = rgb_image.shape[:2]
-
-            # Изменяем размер карты NDVI, чтобы он соответствовал RGB-изображению
-            # Используем INTER_NEAREST, чтобы избежать создания новых значений NDVI при интерполяции
-            resized_ndvi_map = cv2.resize(ndvi_map, (w, h), interpolation=cv2.INTER_NEAREST)
-
-            problem_mask = (resized_ndvi_map < threshold) & (~np.isnan(resized_ndvi_map))
-            bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
-            gray_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
-            gray_bgr = cv2.cvtColor(gray_image, cv2.COLOR_GRAY2BGR)
-
-            red_layer = np.zeros_like(gray_bgr)
-            red_layer[:, :] = [0, 0, 255] # BGR -> Red
-
-            output_image = gray_bgr.copy()
-            if np.any(problem_mask):
-                # Накладываем красный цвет с 40% прозрачностью
-                blended = cv2.addWeighted(gray_bgr[problem_mask], 0.6, red_layer[problem_mask], 0.4, 0)
-                output_image[problem_mask] = blended
-
-            _, buffer = cv2.imencode('.jpg', output_image)
-            return base64.b64encode(buffer).decode('utf-8')
-
-        except Exception as e:
-            logger.error(f"Ошибка при создании карты проблемных зон: {e}")
-            return ""
-
-
-    # --- Методы для работы с полными данными анализа ---
-
-    def _save_analysis_data(self, token: str, analysis_id: str, analysis_data: Dict) -> bool:
-        """Сохраняет ПОЛНЫЕ данные анализа (включая изображения) в базу данных."""
-        try:
-            analysis_data_serialized = json.dumps(analysis_data, default=str)
-            return self.db.save_analysis_data(token, analysis_id, analysis_data_serialized)
-        except Exception as e:
-            logger.error(f"Ошибка сохранения анализа: {e}")
-            return False
-    
-    def _load_analysis_data(self, token: str, analysis_id: str) -> Optional[Dict]:
-        """Загружает данные анализа из базы данных."""
-        try:
-            data = self.db.get_analysis_data(token, analysis_id)
-            if data: return json.loads(data)
-            return None
-        except Exception as e:
-            logger.error(f"Ошибка загрузки анализа: {e}")
-            return None
-    
-    # --- Основной публичный метод ---
-
-    def perform_complete_analysis(self, token: str, start_date: str, end_date: str, 
-                                lon: Optional[float] = None, lat: Optional[float] = None, 
-                                radius_km: float = 0.5, 
-                                polygon_coords: Optional[List[List[float]]] = None) -> Dict:
-        """
-        Выполняет полный цикл анализа: получает снимки, рассчитывает индексы,
-        генерирует все необходимые изображения и сохраняет результат.
-        """
-        try:
-            GEEInitializer.initialize_gee()
-            
-            area_info = {}
-            area_of_interest = None
-            if polygon_coords:
-                area_info = {'type': 'polygon', 'coordinates': polygon_coords}
-                # <<< --- ИСПРАВЛЕНИЕ: Оборачиваем координаты в дополнительный список для правильного формата GEE --- >>>
-                area_of_interest = ee.Geometry.Polygon([polygon_coords])
-                logger.info(f"Запуск анализа коллекции для полигона...")
-            elif lon is not None and lat is not None:
-                area_info = {'type': 'point_radius', 'lon': lon, 'lat': lat, 'radius_km': radius_km}
-                point = ee.Geometry.Point([lon, lat])
-                area_of_interest = point.buffer(radius_km * 1000)
-                logger.info(f"Запуск анализа коллекции для: {lon}, {lat} с радиусом {radius_km} км")
-            else:
-                raise ValueError("Не указана область для анализа (ни точка с радиусом, ни полигон).")
-
-            bounds_coords_list = area_of_interest.bounds().coordinates().get(0).getInfo()
-            bounds_for_leaflet = [[bounds_coords_list[0][1], bounds_coords_list[0][0]], [bounds_coords_list[2][1], bounds_coords_list[2][0]]]
-
-            image_data_list = ImageProvider.get_images_from_gee_collection(
-                start_date=start_date, end_date=end_date,
-                area_of_interest=area_of_interest
-            )
-            
-            all_results = []
-            
-            for image_data in image_data_list:
-                calculator = VegetationIndexCalculator(
-                    rgb_image=image_data['rgb_image'], red_channel=image_data['red_channel'],
-                    green_channel=image_data['green_channel'], blue_channel=image_data['blue_channel'],
-                    nir_channel=image_data['nir_channel']
-                )
-                
-                indices = self._calculate_all_indices(calculator)
-                
-                colored_ndvi_base64 = self._colorize_ndvi(indices['ndvi']['map'])
-                problem_zones_base64 = self._create_problem_zones_image(
-                    rgb_image=image_data['rgb_image'],
-                    ndvi_map=indices['ndvi']['map']
-                )
-                
-                single_image_result = {
-                    'date': image_data['date'],
-                    'cloud_coverage': image_data['cloud_percentage'],
-                    'images': {
-                        'rgb': self._rgb_array_to_base64(image_data['rgb_image']),
-                        'ndvi': self._array_to_base64(indices['ndvi']['map']),
-                        'savi': self._array_to_base64(indices['savi']['map']),
-                        'vari': self._array_to_base64(indices['vari']['map']),
-                        'evi': self._array_to_base64(indices['evi']['map'])
-                    },
-                    'ndvi_overlay_image': colored_ndvi_base64,
-                    'problem_zones_image': problem_zones_base64,
-                    'bounds': bounds_for_leaflet,
-                    'statistics': {
-                        'ndvi': indices['ndvi']['stats'],
-                        'savi': indices['savi']['stats'],
-                        'vari': indices['vari']['stats'],
-                        'evi': indices['evi']['stats']
-                    },
-                    'zoning': {
-                        'ndvi': indices['ndvi']['zones']
-                    }
-                }
-                all_results.append(single_image_result)
-
-            analysis_id = str(int(time.time()))
-            all_results.sort(key=lambda x: x['date'])
-            analysis_data_response = {
-                'analysis_id': analysis_id,
-                'timestamp': time.time(),
-                'area_of_interest': area_info,
-                'date_range': {'start': start_date, 'end': end_date},
-                'image_count': len(all_results),
-                'results_per_image': all_results,
-                'metadata': { 'resolution': '10m', 'source': 'Sentinel-2' }
-            }
-            
-            if self._save_analysis_data(token, analysis_id, analysis_data_response):
-                self._update_user_analyses_list(token, analysis_id, analysis_data_response)
-                logger.info(f"Анализ коллекции {analysis_id} успешно сохранен")
-                return {'status': 'success', 'analysis_id': analysis_id, 'data': analysis_data_response}
-            else:
-                raise Exception("Не удалось сохранить анализ")
-                
-        except Exception as e:
-            logger.error(f"Ошибка при выполнении анализа коллекции: {e}")
-            return {'status': 'error', 'detail': str(e)}
-    
-    def _update_user_analyses_list(self, token: str, analysis_id: str, analysis_data: Dict):
-        """Обновляет список анализов пользователя с краткой сводкой."""
-        try:
-            user_data_obj = self._get_user_data_object(token)
-            
-            avg_ndvi, avg_vari, avg_evi = 0, 0, 0
-            if analysis_data.get('image_count', 0) > 0:
-                ndvis = [r['statistics']['ndvi']['mean'] for r in analysis_data['results_per_image']]
-                varis = [r['statistics']['vari']['mean'] for r in analysis_data['results_per_image']]
-                evis = [r['statistics']['evi']['mean'] for r in analysis_data['results_per_image']]
-                avg_ndvi = sum(ndvis) / len(ndvis) if ndvis else 0
-                avg_vari = sum(varis) / len(varis) if varis else 0
-                avg_evi = sum(evis) / len(evis) if evis else 0
-
-            new_analysis = {
-                'analysis_id': analysis_id,
-                'timestamp': analysis_data['timestamp'],
-                'area_of_interest': analysis_data['area_of_interest'],
-                'date_range': analysis_data['date_range'],
-                'image_count': analysis_data.get('image_count', 0),
-                'statistics_summary': {
-                    'ndvi_mean': avg_ndvi,
-                    'vari_mean': avg_vari,
-                    'evi_mean': avg_evi
-                }
-            }
-            
-            user_data_obj['analyses'].insert(0, new_analysis)
-            user_data_obj['analyses'] = user_data_obj['analyses'][:50]
-            
-            self._save_user_data_object(token, user_data_obj)
-            
-        except Exception as e:
-            logger.error(f"Ошибка обновления списка анализов: {e}")
-    
-    # --- CRUD-методы для управления анализами ---
-
-    def get_analysis_by_id(self, token: str, analysis_id: str) -> Dict:
-        """Получает конкретный анализ по ID."""
-        try:
-            analysis_data = self._load_analysis_data(token, analysis_id)
-            if analysis_data:
-                return {'status': 'success', 'analysis_id': analysis_id, 'data': analysis_data}
-            else:
-                return {'status': 'error', 'detail': 'Анализ не найден'}
-        except Exception as e:
-            logger.error(f"Ошибка получения анализа: {e}")
-            return {'status': 'error', 'detail': str(e)}
-    
-    def delete_analysis(self, token: str, analysis_id: str) -> Dict:
-        """Удаляет анализ из основной БД и из списка пользователя."""
-        try:
-            self.db.delete_analysis_data(token, analysis_id)
-            
-            user_data_obj = self._get_user_data_object(token)
-            initial_count = len(user_data_obj.get('analyses', []))
-            
-            user_data_obj['analyses'] = [
-                analysis for analysis in user_data_obj.get('analyses', []) 
-                if analysis.get('analysis_id') != analysis_id
+            command = [
+                'openssl', 'req', '-x509', '-newkey', 'rsa:4096', '-keyout', str(self.ssl_keyfile),
+                '-out', str(self.ssl_certfile), '-sha256', '-days', '365', '-nodes',
+                '-subj', '/CN=localhost'
             ]
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            logger.info("Самоподписанные SSL-сертификаты успешно сгенерированы.")
+            print("Сертификаты успешно сгенерированы.")
+        except FileNotFoundError:
+            error_message = "КРИТИЧЕСКАЯ ОШИБКА: OpenSSL не найден."
+            logger.error(error_message)
+            print(f"ОШИБКА: {error_message}")
+            raise
+        except subprocess.CalledProcessError as e:
+            error_message = f"Ошибка при генерации сертификатов: {e.stderr}"
+            logger.error(error_message)
+            print(f"ОШИБКА: {error_message}")
+            raise
+
+    def get_local_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.1)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            return local_ip
+        except Exception:
+            return "127.0.0.1"
+
+    def _kill_process_on_port(self, port):
+        pid = None
+        try:
+            result = subprocess.run(['lsof', '-ti', f'tcp:{port}'], capture_output=True, text=True)
+            if result.returncode == 0 and result.stdout.strip():
+                pid = int(result.stdout.strip().split('\n')[0])
+        except (subprocess.CalledProcessError, FileNotFoundError, ValueError): pass
+        
+        if not pid: return False
+        
+        try:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(2)
+            try:
+                os.kill(pid, 0)
+                os.kill(pid, signal.SIGKILL)
+            except OSError: pass
+            print(f"Процесс с PID {pid} на порту {port} успешно завершен.")
+            return True
+        except (ProcessLookupError, PermissionError) as e:
+            print(f"Ошибка при завершении процесса {pid}: {e}")
+            return False
+
+    def _controllers(self):
+        logger.info("Регистрация маршрутов...")
+        
+        api_router = APIRouter(prefix="/api")
+
+        @api_router.post("/savedata")
+        async def save_data_by_token(token: str = Query(...), key_array: str = Query(...)):
+            return await self.func.save_data_by_token(token, key_array)
+
+        @api_router.get("/givefield")
+        async def get_field_by_token(token: str = Query(...)):
+            return await self.func.get_field_by_token(token)
+
+        @api_router.get("/log")
+        async def get_log(password: str = Query(...)):
+            return await self.func.get_log(password)
+
+        @api_router.get("/get_token")
+        async def get_token(login: str = Query(...), password: str = Query(...)):
+            return await self.func.get_token(login, password)
+
+        @api_router.post("/add_user")
+        async def add_user(login: str = Query(...), password: str = Query(...), first_name: str = Query(...), last_name: str = Query(...)):
+            return await self.func.add_user(login, password, first_name, last_name)
+
+        @api_router.get("/users/all")
+        async def get_all_users(password: str = Query(...)):
+            return await self.func.get_all_users(password)
             
-            if len(user_data_obj['analyses']) < initial_count:
-                self._save_user_data_object(token, user_data_obj)
-                logger.info(f"Анализ {analysis_id} удален из списка пользователя {token}")
-                return {'status': 'success', 'message': 'Анализ успешно удален'}
-            else:
-                logger.warning(f"Анализ {analysis_id} не был найден в списке пользователя {token} для удаления.")
-                return {'status': 'success', 'message': 'Анализ успешно удален'}
-                
-        except Exception as e:
-            logger.error(f"Критическая ошибка при удалении анализа {analysis_id}: {e}")
-            return {'status': 'error', 'detail': str(e)}
+        @api_router.get("/users/profile")
+        async def get_user_profile(token: str = Query(...)):
+            return await self.func.get_user_profile(token)
+
+        @api_router.get("/health")
+        async def health_check():
+            return await self.func.health_check()
+
+        @api_router.put("/data/update")
+        async def update_user_data(token: str = Query(...), key_array: str = Query(...)):
+            return await self.func.update_user_data(token, key_array)
+
+        @api_router.patch("/data/edit")
+        async def edit_user_data(token: str = Query(...), new_keys: str = Query(None), keys_to_add: str = Query(None), keys_to_remove: str = Query(None)):
+            return await self.func.edit_user_data(token, new_keys, keys_to_add, keys_to_remove)
+
+        @api_router.delete("/data/delete")
+        async def delete_user_data(token: str = Query(...)):
+            return await self.func.delete_user_data(token)
+
+        @api_router.get("/data/check")
+        async def check_user_data_exists(token: str = Query(...)):
+            return await self.func.check_user_data_exists(token)
+
+        @api_router.post("/field/set")
+        async def set_field_data(field: str = Query(...), data: str = Query(...), token: str = Query(...)):
+            return await self.func.set_field_data(field, data, token)
+
+        @api_router.get("/field/get")
+        async def get_field_data(field: str = Query(...), token: str = Query(None)):
+            return await self.func.get_field_data(field, token)
+
+        @api_router.delete("/field/delete")
+        async def delete_field_data(field: str = Query(...), token: str = Query(...)):
+            return await self.func.delete_field_data(field, token)
+
+        @api_router.get("/field/check")
+        async def check_field_exists(field: str = Query(...), token: str = Query(None)):
+            return await self.func.check_field_exists(field, token)
+
+        @api_router.get("/image/rgb")
+        async def get_rgb_image(lon: float = Query(...), lat: float = Query(...), start_date: str = Query(...), end_date: str = Query(...), token: str = Query(...)):
+            return await self.func.get_rgb_image(lon, lat, start_date, end_date, token)
+
+        @api_router.get("/image/red-channel")
+        async def get_red_channel_image(lon: float = Query(...), lat: float = Query(...), start_date: str = Query(...), end_date: str = Query(...), token: str = Query(...)):
+            return await self.func.get_red_channel_image(lon, lat, start_date, end_date, token)
+
+        @api_router.get("/image/ndvi")
+        async def get_ndvi_image(lon: float = Query(...), lat: float = Query(...), start_date: str = Query(...), end_date: str = Query(...), token: str = Query(...)):
+            return await self.func.get_ndvi_image(lon, lat, start_date, end_date, token)
+        
+        @api_router.post("/analysis/perform")
+        async def perform_analysis(token: str = Query(...), start_date: str = Query(...), end_date: str = Query(...), lon: float = Query(None), lat: float = Query(None), radius_km: float = Query(0.5), polygon_coords: str = Query(None)):
+            return await self.func.perform_analysis(token, start_date, end_date, lon, lat, radius_km, polygon_coords)
+
+        @api_router.get("/analysis/list")
+        async def get_analyses_list(token: str = Query(...)):
+            return await self.func.get_analyses_list(token)
+
+        @api_router.get("/analysis/{analysis_id}")
+        async def get_analysis(analysis_id: str, token: str = Query(...)):
+            return await self.func.get_analysis(token, analysis_id)
+
+        @api_router.delete("/analysis/{analysis_id}")
+        async def delete_analysis(analysis_id: str, token: str = Query(...)):
+            return await self.func.delete_analysis(token, analysis_id)
+        
+        @api_router.get("/analysis/{analysis_id}/recommendations")
+        async def get_ai_recommendations(analysis_id: str, token: str = Query(...)):
+            return await self.func.get_ai_recommendations(token, analysis_id, if_use_token=self.token_use)
+        
+        @api_router.get("/analysis/timeseries")
+        async def get_historical_ndvi(
+                token: str = Query(..., description="Токен пользователя"),
+                lon: float = Query(None, description="Долгота центральной точки"),
+                lat: float = Query(None, description="Широта центральной точки"),
+                radius_km: float = Query(0.5, description="Радиус в километрах"),
+                polygon_coords: str = Query(None, description="Координаты полигона в виде JSON-строки")
+        ):
+            return await self.func.get_historical_ndvi_data(token, lon, lat, radius_km, polygon_coords)
+        
+        @api_router.post("/fields/save")
+        async def save_user_field(token: str = Query(...), field_name: str = Query(...), area_of_interest: str = Query(...)):
+            return await self.func.save_user_field(token, field_name, area_of_interest)
+
+        @api_router.get("/fields/list")
+        async def get_user_fields(token: str = Query(...)):
+            return await self.func.get_user_fields(token)
+
+        @api_router.delete("/fields/{field_id}")
+        async def delete_user_field(field_id: str, token: str = Query(...)):
+            return await self.func.delete_user_field(token, field_id)
+
+        self.app.include_router(api_router)
+        self.app.mount("/", StaticFiles(directory="scr", html=True), name="static")
+
+    def run(self):
+        protocol = "HTTPS" if self.use_https else "HTTP"
+        logger.info(f"Запуск {protocol} сервера...")
+        self._controllers()
+        logger.info(f"Сервер запущен на 0.0.0.0:8000 с использованием {protocol}")
+        
+        uvicorn_config = {
+            "host": "0.0.0.0",
+            "port": 8000,
+            "log_level": "info",
+        }
+
+        if self.use_https:
+            if not self.ssl_keyfile or not self.ssl_certfile:
+                 logger.error("SSL файлы не были установлены для HTTPS режима.")
+                 return
+            uvicorn_config["ssl_keyfile"] = str(self.ssl_keyfile)
+            uvicorn_config["ssl_certfile"] = str(self.ssl_certfile)
+        
+        uvicorn.run(self.app, **uvicorn_config)

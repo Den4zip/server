@@ -1,267 +1,550 @@
-import uvicorn
-from dbrequest import DatabaseManager
-import subprocess
-import controller_func
-import signal
-import socket
+import random
 import logging
-from fastapi import FastAPI, Query, APIRouter
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 import time
+from analysis_manager import AnalysisManager
 import os
-import pathlib
-from fastapi.middleware.cors import CORSMiddleware
+import json
+from ImageProvider import ImageProvider
+import ee
+from gigachat_service import GigaChatService
 
 logger = logging.getLogger(__name__)
 
-class controller():
-    def __init__(self, port, use_https=True, token_use=True):
-        logger.info("Инициализация контроллера...")
-        self.use_https = use_https
-        self.token_use = token_use
-        self.ssl_keyfile = None
-        self.ssl_certfile = None
+class controller_func():
+    def __init__(self, db_manager):
+        self.db = db_manager
+        self.analysis_manager = AnalysisManager(db_manager)
+        self.ai_service = GigaChatService()
 
-        protocol = "https" if self.use_https else "http"
-
-        if self.use_https:
-            self.ssl_keyfile = pathlib.Path("key.pem")
-            self.ssl_certfile = pathlib.Path("cert.pem")
-            self._setup_ssl()
-
-        ip = self.get_local_ip()
-        print(f"Сервер будет доступен по адресам ({protocol.upper()}):")
-        print(f"Локально: {protocol}://localhost:80")
-        print(f"В сети: {protocol}://{ip}:80")
-        if not self.use_https:
-            print("\nВНИМАНИЕ: Сервер запущен в небезопасном режиме HTTP.")
-            print("Для производственного использования рекомендуется HTTPS.\n")
-        print("Для остановки сервера нажмите Ctrl+C")
-
-        self._kill_process_on_port(port)
-        self.app = FastAPI()
-
-        self.app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
-        self.db = DatabaseManager()
-        self.func = controller_func.controller_func(self.db)
-
-        logger.info("Контроллер инициализирован")
-
-    def _setup_ssl(self):
-        logger.info("Проверка SSL-сертификатов...")
-        if self.ssl_keyfile.exists() and self.ssl_certfile.exists():
-            logger.info("Найдены существующие SSL-сертификаты. Используются они.")
-            print("Найдены существующие SSL-сертификаты (key.pem, cert.pem).")
-            return
-
-        logger.warning("SSL-сертификаты не найдены. Генерация самоподписанных сертификатов...")
-        print("\nВНИМАНИЕ: SSL-сертификаты не найдены.")
-        print("Генерируются самоподписанные сертификаты (key.pem, cert.pem).")
-        print("Браузер будет выдавать предупреждение о безопасности, это нормально для самоподписанных сертификатов.")
-        
-        try:
-            command = [
-                'openssl', 'req', '-x509', '-newkey', 'rsa:4096', '-keyout', str(self.ssl_keyfile),
-                '-out', str(self.ssl_certfile), '-sha256', '-days', '365', '-nodes',
-                '-subj', '/CN=localhost'
-            ]
-            subprocess.run(command, check=True, capture_output=True, text=True)
-            logger.info("Самоподписанные SSL-сертификаты успешно сгенерированы.")
-            print("Сертификаты успешно сгенерированы.")
-        except FileNotFoundError:
-            error_message = "КРИТИЧЕСКАЯ ОШИБКА: OpenSSL не найден."
-            logger.error(error_message)
-            print(f"ОШИБКА: {error_message}")
-            raise
-        except subprocess.CalledProcessError as e:
-            error_message = f"Ошибка при генерации сертификатов: {e.stderr}"
-            logger.error(error_message)
-            print(f"ОШИБКА: {error_message}")
-            raise
-
-    def get_local_ip(self):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(0.1)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-            return local_ip
-        except Exception:
-            return "127.0.0.1"
-
-    def _kill_process_on_port(self, port):
-        pid = None
-        try:
-            result = subprocess.run(['lsof', '-ti', f'tcp:{port}'], capture_output=True, text=True)
-            if result.returncode == 0 and result.stdout.strip():
-                pid = int(result.stdout.strip().split('\n')[0])
-        except (subprocess.CalledProcessError, FileNotFoundError, ValueError): pass
-        
-        if not pid: return False
-        
-        try:
-            os.kill(pid, signal.SIGTERM)
-            time.sleep(2)
+    def _get_user_data_object(self, token: str) -> dict:
+        """Вспомогательная функция для получения и парсинга данных пользователя."""
+        data_str = self.db.get_user_data(token)
+        if data_str:
             try:
-                os.kill(pid, 0)
-                os.kill(pid, signal.SIGKILL)
-            except OSError: pass
-            print(f"Процесс с PID {pid} на порту {port} успешно завершен.")
-            return True
-        except (ProcessLookupError, PermissionError) as e:
-            print(f"Ошибка при завершении процесса {pid}: {e}")
+                data_obj = json.loads(data_str)
+                if 'analyses' not in data_obj:
+                    data_obj['analyses'] = []
+                if 'saved_fields' not in data_obj:
+                    data_obj['saved_fields'] = []
+                return data_obj
+            except json.JSONDecodeError:
+                logger.warning(f"Не удалось распарсить JSON для токена {token}. Возвращаем пустую структуру.")
+                return {'analyses': [], 'saved_fields': []}
+        return {'analyses': [], 'saved_fields': []}
+
+    def _save_user_data_object(self, token: str, data_obj: dict) -> bool:
+        """Вспомогательная функция для сохранения объекта данных пользователя."""
+        try:
+            data_str = json.dumps(data_obj)
+            return self.db.save_user_data(token, data_str)
+        except Exception as e:
+            logger.error(f"Ошибка при сериализации и сохранении данных для токена {token}: {e}")
             return False
 
-    def _controllers(self):
-        logger.info("Регистрация маршрутов...")
-        
-        api_router = APIRouter(prefix="/api")
-
-        @api_router.post("/savedata")
-        async def save_data_by_token(token: str = Query(...), key_array: str = Query(...)):
-            return await self.func.save_data_by_token(token, key_array)
-
-        @api_router.get("/givefield")
-        async def get_field_by_token(token: str = Query(...)):
-            return await self.func.get_field_by_token(token)
-
-        @api_router.get("/log")
-        async def get_log(password: str = Query(...)):
-            return await self.func.get_log(password)
-
-        @api_router.get("/get_token")
-        async def get_token(login: str = Query(...), password: str = Query(...)):
-            return await self.func.get_token(login, password)
-
-        @api_router.post("/add_user")
-        async def add_user(login: str = Query(...), password: str = Query(...), first_name: str = Query(...), last_name: str = Query(...)):
-            return await self.func.add_user(login, password, first_name, last_name)
-
-        @api_router.get("/users/all")
-        async def get_all_users(password: str = Query(...)):
-            return await self.func.get_all_users(password)
-            
-        @api_router.get("/users/profile")
-        async def get_user_profile(token: str = Query(...)):
-            return await self.func.get_user_profile(token)
-
-        @api_router.get("/health")
-        async def health_check():
-            return await self.func.health_check()
-
-        @api_router.put("/data/update")
-        async def update_user_data(token: str = Query(...), key_array: str = Query(...)):
-            return await self.func.update_user_data(token, key_array)
-
-        @api_router.patch("/data/edit")
-        async def edit_user_data(token: str = Query(...), new_keys: str = Query(None), keys_to_add: str = Query(None), keys_to_remove: str = Query(None)):
-            return await self.func.edit_user_data(token, new_keys, keys_to_add, keys_to_remove)
-
-        @api_router.delete("/data/delete")
-        async def delete_user_data(token: str = Query(...)):
-            return await self.func.delete_user_data(token)
-
-        @api_router.get("/data/check")
-        async def check_user_data_exists(token: str = Query(...)):
-            return await self.func.check_user_data_exists(token)
-
-        @api_router.post("/field/set")
-        async def set_field_data(field: str = Query(...), data: str = Query(...), token: str = Query(...)):
-            return await self.func.set_field_data(field, data, token)
-
-        @api_router.get("/field/get")
-        async def get_field_data(field: str = Query(...), token: str = Query(None)):
-            return await self.func.get_field_data(field, token)
-
-        @api_router.delete("/field/delete")
-        async def delete_field_data(field: str = Query(...), token: str = Query(...)):
-            return await self.func.delete_field_data(field, token)
-
-        @api_router.get("/field/check")
-        async def check_field_exists(field: str = Query(...), token: str = Query(None)):
-            return await self.func.check_field_exists(field, token)
-
-        @api_router.get("/image/rgb")
-        async def get_rgb_image(lon: float = Query(...), lat: float = Query(...), start_date: str = Query(...), end_date: str = Query(...), token: str = Query(...)):
-            return await self.func.get_rgb_image(lon, lat, start_date, end_date, token)
-
-        @api_router.get("/image/red-channel")
-        async def get_red_channel_image(lon: float = Query(...), lat: float = Query(...), start_date: str = Query(...), end_date: str = Query(...), token: str = Query(...)):
-            return await self.func.get_red_channel_image(lon, lat, start_date, end_date, token)
-
-        @api_router.get("/image/ndvi")
-        async def get_ndvi_image(lon: float = Query(...), lat: float = Query(...), start_date: str = Query(...), end_date: str = Query(...), token: str = Query(...)):
-            return await self.func.get_ndvi_image(lon, lat, start_date, end_date, token)
-        
-        @api_router.post("/analysis/perform")
-        async def perform_analysis(token: str = Query(...), start_date: str = Query(...), end_date: str = Query(...), lon: float = Query(None), lat: float = Query(None), radius_km: float = Query(0.5), polygon_coords: str = Query(None)):
-            return await self.func.perform_analysis(token, start_date, end_date, lon, lat, radius_km, polygon_coords)
-
-        @api_router.get("/analysis/list")
-        async def get_analyses_list(token: str = Query(...)):
-            return await self.func.get_analyses_list(token)
-
-        @api_router.get("/analysis/{analysis_id}")
-        async def get_analysis(analysis_id: str, token: str = Query(...)):
-            return await self.func.get_analysis(token, analysis_id)
-
-        @api_router.delete("/analysis/{analysis_id}")
-        async def delete_analysis(analysis_id: str, token: str = Query(...)):
-            return await self.func.delete_analysis(token, analysis_id)
-        
-        @api_router.get("/analysis/{analysis_id}/recommendations")
-        async def get_ai_recommendations(analysis_id: str, token: str = Query(...)):
-            return await self.func.get_ai_recommendations(token, analysis_id, if_use_token=self.token_use)
-        
-        @api_router.get("/analysis/timeseries")
-        async def get_historical_ndvi(
-                token: str = Query(..., description="Токен пользователя"),
-                lon: float = Query(None, description="Долгота центральной точки"),
-                lat: float = Query(None, description="Широта центральной точки"),
-                radius_km: float = Query(0.5, description="Радиус в километрах"),
-                polygon_coords: str = Query(None, description="Координаты полигона в виде JSON-строки")
-        ):
-            return await self.func.get_historical_ndvi_data(token, lon, lat, radius_km, polygon_coords)
-        
-        @api_router.post("/fields/save")
-        async def save_user_field(token: str = Query(...), field_name: str = Query(...), area_of_interest: str = Query(...)):
-            return await self.func.save_user_field(token, field_name, area_of_interest)
-
-        @api_router.get("/fields/list")
-        async def get_user_fields(token: str = Query(...)):
-            return await self.func.get_user_fields(token)
-
-        @api_router.delete("/fields/{field_id}")
-        async def delete_user_field(field_id: str, token: str = Query(...)):
-            return await self.func.delete_user_field(token, field_id)
-
-        self.app.include_router(api_router)
-        self.app.mount("/", StaticFiles(directory="scr", html=True), name="static")
-
-    def run(self):
-        protocol = "HTTPS" if self.use_https else "HTTP"
-        logger.info(f"Запуск {protocol} сервера...")
-        self._controllers()
-        logger.info(f"Сервер запущен на 0.0.0.0:8000 с использованием {protocol}")
-        
-        uvicorn_config = {
-            "host": "0.0.0.0",
-            "port": 8000,
-            "log_level": "info",
+    async def health_check(self):
+        """Проверка здоровья сервера"""
+        return {
+            "status": "healthy",
+            "message": "Server is running",
+            "timestamp": time.time()
         }
 
-        if self.use_https:
-            if not self.ssl_keyfile or not self.ssl_certfile:
-                 logger.error("SSL файлы не были установлены для HTTPS режима.")
-                 return
-            uvicorn_config["ssl_keyfile"] = str(self.ssl_keyfile)
-            uvicorn_config["ssl_certfile"] = str(self.ssl_certfile)
+    async def save_data_by_token(self, token: str, key_array: str):
+        """Сохраняет данные пользователя по токену"""
+        logger.info(f"Запрос на сохранение данных для токена: {token}")
+        try:
+            if not self.db.if_token_exist(token):
+                logger.warning(f"Попытка сохранения данных для несуществующего токена: {token}")
+                return {"status": "error", "detail": "Токен не найден"}
+            
+            success = self.db.save_user_data(token, key_array)
+            if not success:
+                logger.error(f"Не удалось сохранить данные для токена: {token}")
+                return {"status": "error", "detail": "Не удалось сохранить данные"}
+
+            logger.info(f"Данные для токена {token} успешно сохранены")
+            return {"status": "success", "message": "Данные успешно сохранены", "token": token}
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении данных для токена {token}: {e}")
+            return {"status": "error", "detail": "Внутренняя ошибка сервера"}
+
+    async def get_field_by_token(self, token: str):
+        logger.info(f"Запрос данных для токена: {token}")
+        try:
+            keys = self.db.get_user_data(token)
+            if keys is not None:
+                return {"status": "success", "keys": keys}
+            else:
+                return {"status": "dismiss", "message": "Данные не найдены"}
+        except Exception as e:
+            logger.error(f"Ошибка при получении данных для токена {token}: {e}")
+            return {"status": "error", "detail": "Внутренняя ошибка сервера"}
+
+    async def get_log(self, password: str):
+        logger.info("Запрос логов администратора")
+        try:
+            if password == "12345":
+                return FileResponse("scr/app.log")
+            else:
+                return {"status": "error", "detail": "Доступ запрещен"}
+        except Exception as e:
+            logger.error(f"Ошибка при чтении логов: {e}")
+            return {"status": "error", "detail": "Файл логов не найден"}
+
+    async def get_token(self, login: str, password: str):
+        logger.info(f"Запрос токена для пользователя: {login}")
+        try:
+            token = self.db.get_token(login, password)
+            if token is None:
+                if not self.db.user_exists(login):
+                    logger.warning(f"Пользователь не найден: {login}")
+                    return {"status": "error", "detail": "Пользователь не найден"}
+                else:
+                    logger.warning(f"Неверный пароль для пользователя: {login}")
+                    return {"status": "error", "detail": "Неверный пароль"}
+
+            logger.info(f"Токен успешно выдан для пользователя: {login}")
+            return {"status": "success", "token": token, "message": "Токен успешно получен"}
+        except Exception as e:
+            logger.error(f"Ошибка в get_token для {login}: {e}")
+            return {"status": "error", "detail": "Внутренняя ошибка сервера"}
+
+    async def add_user(self, login: str, password: str, first_name: str, last_name: str):
+        """Добавление нового пользователя с именем и фамилией"""
+        logger.info(f"Запрос на добавление пользователя: {login}")
+        try:
+            if self.db.user_exists(login):
+                logger.warning(f"Попытка регистрации существующего пользователя: {login}")
+                return {"status": "error", "detail": "Пользователь с таким логином уже существует"}
+
+            logger.info(f"Генерация токена для пользователя: {login}")
+            token = str(random.randint(10 * 10 ** 20, 10 * 10 ** 21))
+            while self.db.if_token_exist(token):
+                logger.debug(f"Токен {token} уже существует, генерируем новый")
+                token = str(random.randint(10 * 10 ** 20, 10 * 10 ** 21))
+
+            logger.info(f"Добавление пользователя {login} с токеном: {token}")
+            success = self.db.add_new_user(login, password, token, first_name, last_name)
+            if not success:
+                logger.error(f"Не удалось добавить пользователя: {login}")
+                return {"status": "error", "detail": "Не удалось добавить пользователя"}
+
+            logger.info(f"Пользователь {login} успешно зарегистрирован")
+            return {"status": "success", "message": "Пользователь успешно добавлен", "login": login, "first_name": first_name, "last_name": last_name}
+        except Exception as e:
+            logger.error(f"Ошибка в add_user для {login}: {e}")
+            return {"status": "error", "detail": "Внутренняя ошибка сервера"}
+
+    async def get_all_users(self, password: str):
+        """Получение списка всех пользователей (только для администратора)"""
+        logger.info("Запрос списка всех пользователей")
+        try:
+            if password != "12345":
+                logger.warning("Неудачная попытка доступа к списку пользователей")
+                return {"status": "error", "detail": "Доступ запрещен"}
+            
+            users_list = self.db.get_all_users()
+            return {"status": "success", "users": users_list}
+        except Exception as e:
+            logger.error(f"Ошибка при получении списка пользователей: {e}")
+            return {"status": "error", "detail": "Внутренняя ошибка сервера"}
+
+    async def get_user_profile(self, token: str):
+        """Получение данных профиля пользователя по токену."""
+        logger.info(f"Запрос профиля пользователя по токену: {token}")
+        try:
+            user_info = self.db.get_user_info_by_token(token)
+            if user_info:
+                return {"status": "success", "user": user_info}
+            else:
+                logger.warning(f"Профиль не найден для токена: {token}")
+                return {"status": "error", "detail": "Токен недействителен или пользователь не найден"}
+        except Exception as e:
+            logger.error(f"Ошибка при получении профиля пользователя: {e}")
+            return {"status": "error", "detail": "Внутренняя ошибка сервера"}
+
+    async def update_user_data(self, token: str, key_array: str):
+        logger.info(f"Запрос на обновление данных для токена: {token}")
+        try:
+            success = self.db.save_user_data(token, key_array)
+            if success:
+                return {"status": "success", "message": "Данные успешно обновлены", "token": token}
+            else:
+                return {"status": "error", "detail": "Токен не найден или данные не обновлены"}
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении данных для токена {token}: {e}")
+            return {"status": "error", "detail": "Внутренняя ошибка сервера"}
+
+    async def edit_user_data(self, token: str, new_keys: str = None, keys_to_add: str = None, keys_to_remove: str = None):
+        logger.info(f"Запрос на редактирование данных для токена: {token}")
+        try:
+            current_data_str = self.db.get_user_data(token)
+            if current_data_str is None:
+                return {"status": "error", "detail": "Токен не найден"}
+
+            current_key_array = current_data_str
+            if new_keys is not None:
+                updated_key_array = new_keys
+            else:
+                updated_key_array = current_key_array
+                if keys_to_add:
+                    current_keys = set(updated_key_array.split(',')) if updated_key_array else set()
+                    keys_to_add_set = set(keys_to_add.split(','))
+                    updated_key_array = ','.join(current_keys.union(keys_to_add_set))
+                if keys_to_remove:
+                    current_keys = set(updated_key_array.split(',')) if updated_key_array else set()
+                    keys_to_remove_set = set(keys_to_remove.split(','))
+                    updated_key_array = ','.join(current_keys - keys_to_remove_set) if (current_keys - keys_to_remove_set) else ""
+            
+            success = self.db.save_user_data(token, updated_key_array)
+            if success:
+                return {"status": "success", "message": "Данные успешно отредактированы", "token": token}
+            else:
+                return {"status": "error", "detail": "Не удалось отредактировать данные"}
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании данных для токена {token}: {e}")
+            return {"status": "error", "detail": "Внутренняя ошибка сервера"}
+
+    async def delete_user_data(self, token: str):
+        logger.info(f"Запрос на удаление данных для токена: {token}")
+        try:
+            success = self.db.save_user_data(token, '{}')
+            if success:
+                return {"status": "success", "message": "Данные успешно удалены", "token": token}
+            else:
+                return {"status": "error", "detail": "Токен не найден"}
+        except Exception as e:
+            logger.error(f"Ошибка при удалении данных для токена {token}: {e}")
+            return {"status": "error", "detail": "Внутренняя ошибка сервера"}
+
+    async def check_user_data_exists(self, token: str):
+        logger.info(f"Запрос проверки данных для токена: {token}")
+        try:
+            data = self.db.get_user_data(token)
+            exists = data is not None and data != '{}'
+            return {"status": "success", "exists": exists, "token": token}
+        except Exception as e:
+            logger.error(f"Ошибка при проверке данных для токена {token}: {e}")
+            return {"status": "error", "detail": "Внутренняя ошибка сервера"}
+
+    async def set_field_data(self, field: str, data: str, token: str):
+        logger.info(f"Запрос на установку данных для поля: {field}")
+        try:
+            if not self.db.if_token_exist(token):
+                return {"status": "error", "detail": "Невалидный токен"}
+
+            success = self.db.save_generic_data(field, data)
+            if success:
+                return {"status": "success", "message": "Данные поля успешно сохранены", "field": field}
+            else:
+                return {"status": "error", "detail": "Не удалось сохранить данные поля"}
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении данных для поля {field}: {e}")
+            return {"status": "error", "detail": "Внутренняя ошибка сервера"}
+
+    async def get_field_data(self, field: str, token: str = None):
+        logger.info(f"Запрос данных для поля: {field}")
+        try:
+            if token and not self.db.if_token_exist(token):
+                return {"status": "error", "detail": "Невалидный токен"}
+
+            data = self.db.get_generic_data(field)
+            if data is not None:
+                return {"status": "success", "field": field, "data": data}
+            else:
+                return {"status": "dismiss", "message": "Данные поля не найдены", "field": field}
+        except Exception as e:
+            logger.error(f"Ошибка при получении данных для поля {field}: {e}")
+            return {"status": "error", "detail": "Внутренняя ошибка сервера"}
+
+    async def delete_field_data(self, field: str, token: str):
+        logger.info(f"Запрос на удаление данных поля: {field}")
+        try:
+            if not self.db.if_token_exist(token):
+                return {"status": "error", "detail": "Невалидный токен"}
+
+            success = self.db.delete_generic_data(field)
+            if success:
+                return {"status": "success", "message": "Данные поля успешно удалены", "field": field}
+            else:
+                return {"status": "error", "detail": "Поле не найдено"}
+        except Exception as e:
+            logger.error(f"Ошибка при удалении данных поля {field}: {e}")
+            return {"status": "error", "detail": "Внутренняя ошибка сервера"}
+
+    async def check_field_exists(self, field: str, token: str = None):
+        logger.info(f"Запрос проверки существования поля: {field}")
+        try:
+            if token and not self.db.if_token_exist(token):
+                return {"status": "error", "detail": "Невалидный токен"}
+
+            exists = self.db.generic_data_exists(field)
+            return {"status": "success", "field": field, "exists": exists}
+        except Exception as e:
+            logger.error(f"Ошибка при проверке поля {field}: {e}")
+            return {"status": "error", "detail": "Внутренняя ошибка сервера"}
         
-        uvicorn.run(self.app, **uvicorn_config)
+    async def get_rgb_image(self, lon: float, lat: float, start_date: str, end_date: str, token: str):
+        """Получение RGB изображения по геолокации"""
+        logger.info(f"Запрос RGB изображения для координат: {lon}, {lat}")
+
+        try:
+            if not self.db.if_token_exist(token):
+                logger.warning(f"Попытка получения изображения с невалидным токеном: {token}")
+                return {"status": "error", "detail": "Невалидный токен"}
+
+            provider = ImageProvider.from_gee(lon=lon, lat=lat, start_date=start_date, end_date=end_date)
+            
+            import base64
+            from io import BytesIO
+            from PIL import Image
+            
+            rgb_image_pil = Image.fromarray(provider.rgb_image.astype('uint8'))
+            buffered = BytesIO()
+            rgb_image_pil.save(buffered, format="JPEG")
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+
+            logger.info(f"RGB изображение успешно получено для координат: {lon}, {lat}")
+            return {"status": "success", "image_type": "rgb", "image_data": img_str, "format": "jpeg", "coordinates": {"lon": lon, "lat": lat}, "date_range": {"start": start_date, "end": end_date}}
+
+        except Exception as e:
+            logger.error(f"Ошибка при получении RGB изображения: {e}")
+            return {"status": "error", "detail": f"Не удалось получить изображение: {str(e)}"}
+
+    async def get_red_channel_image(self, lon: float, lat: float, start_date: str, end_date: str, token: str):
+        """Получение изображения красного канала по геолокации"""
+        logger.info(f"Запрос красного канала для координат: {lon}, {lat}")
+        try:
+            if not self.db.if_token_exist(token):
+                return {"status": "error", "detail": "Невалидный токен"}
+
+            provider = ImageProvider.from_gee(lon=lon, lat=lat, start_date=start_date, end_date=end_date)
+            red_channel_normalized = (provider.red_channel - provider.red_channel.min()) / (provider.red_channel.max() - provider.red_channel.min()) * 255
+            red_channel_uint8 = red_channel_normalized.astype('uint8')
+
+            import base64
+            from io import BytesIO
+            from PIL import Image
+            red_image_pil = Image.fromarray(red_channel_uint8)
+            buffered = BytesIO()
+            red_image_pil.save(buffered, format="JPEG")
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+
+            logger.info(f"Красный канал успешно получен для координат: {lon}, {lat}")
+            return {"status": "success", "image_type": "red_channel", "image_data": img_str, "format": "jpeg", "coordinates": {"lon": lon, "lat": lat}, "date_range": {"start": start_date, "end": end_date}, "statistics": {"min_value": float(provider.red_channel.min()), "max_value": float(provider.red_channel.max()), "mean_value": float(provider.red_channel.mean())}}
+        except Exception as e:
+            logger.error(f"Ошибка при получении красного канала: {e}")
+            return {"status": "error", "detail": f"Не удалось получить изображение: {str(e)}"}
+
+    async def get_ndvi_image(self, lon: float, lat: float, start_date: str, end_date: str, token: str):
+        """Получение NDVI изображения по геолокации"""
+        logger.info(f"Запрос NDVI для координат: {lon}, {lat}")
+        try:
+            if not self.db.if_token_exist(token):
+                return {"status": "error", "detail": "Невалидный токен"}
+
+            provider = ImageProvider.from_gee(lon=lon, lat=lat, start_date=start_date, end_date=end_date)
+            ndvi = (provider.nir_channel - provider.red_channel) / (provider.nir_channel + provider.red_channel + 1e-8)
+            ndvi_normalized = ((ndvi + 1) / 2 * 255).clip(0, 255).astype('uint8')
+
+            import base64
+            from io import BytesIO
+            from PIL import Image
+            ndvi_image_pil = Image.fromarray(ndvi_normalized)
+            buffered = BytesIO()
+            ndvi_image_pil.save(buffered, format="JPEG")
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+
+            logger.info(f"NDVI успешно получен для координат: {lon}, {lat}")
+            return {"status": "success", "image_type": "ndvi", "image_data": img_str, "format": "jpeg", "coordinates": {"lon": lon, "lat": lat}, "date_range": {"start": start_date, "end": end_date}, "statistics": {"min_ndvi": float(ndvi.min()), "max_ndvi": float(ndvi.max()), "mean_ndvi": float(ndvi.mean())}}
+        except Exception as e:
+            logger.error(f"Ошибка при получении NDVI: {e}")
+            return {"status": "error", "detail": f"Не удалось вычислить NDVI: {str(e)}"}
+
+    async def perform_analysis(self, token: str, start_date: str, end_date: str, lon: float = None, lat: float = None, radius_km: float = 0.5, polygon_coords: str = None):
+        """Выполняет полный анализ по координатам точки с радиусом или по полигону."""
+        logger.info(f"Запрос полного анализа для токена {token}")
+        try:
+            if not self.db.if_token_exist(token):
+                return {"status": "error", "detail": "Невалидный токен"}
+
+            parsed_polygon_coords = None
+            if polygon_coords:
+                try:
+                    parsed_polygon_coords = json.loads(polygon_coords)
+                    if not isinstance(parsed_polygon_coords, list) or not all(isinstance(p, list) and len(p) == 2 and all(isinstance(coord, (int, float)) for coord in p) for p in parsed_polygon_coords):
+                        raise ValueError("polygon_coords должен быть списком списков координат [[lon, lat], ...]")
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.error(f"Ошибка парсинга polygon_coords='{polygon_coords}': {e}")
+                    return {"status": "error", "detail": f"Неверный формат polygon_coords: {e}"}
+            
+            result = self.analysis_manager.perform_complete_analysis(token=token, start_date=start_date, end_date=end_date, lon=lon, lat=lat, radius_km=radius_km, polygon_coords=parsed_polygon_coords)
+            return result
+        except Exception as e:
+            logger.error(f"Ошибка при выполнении анализа: {e}")
+            return {"status": "error", "detail": f"Не удалось выполнить анализ: {str(e)}"}
+
+    async def get_analyses_list(self, token: str):
+        """Получает список всех анализов пользователя"""
+        logger.info(f"Запрос списка анализов для токена: {token}")
+        try:
+            if not self.db.if_token_exist(token):
+                return {"status": "error", "detail": "Невалидный токен"}
+            
+            user_data_obj = self._get_user_data_object(token)
+            return {"status": "success", "analyses": user_data_obj.get('analyses', [])}
+        except Exception as e:
+            logger.error(f"Ошибка при получении списка анализов: {e}")
+            return {"status": "error", "detail": str(e)}
+
+    async def get_analysis(self, token: str, analysis_id: str):
+        """Получает конкретный анализ по ID"""
+        logger.info(f"Запрос анализа {analysis_id} для токена: {token}")
+        try:
+            if not self.db.if_token_exist(token):
+                return {"status": "error", "detail": "Невалидный токен"}
+
+            result = self.analysis_manager.get_analysis_by_id(token, analysis_id)
+            return result
+        except Exception as e:
+            logger.error(f"Ошибка при получении анализа: {e}")
+            return {"status": "error", "detail": str(e)}
+
+    async def delete_analysis(self, token: str, analysis_id: str):
+        """Удаляет анализ"""
+        logger.info(f"Запрос удаления анализа {analysis_id} для токена: {token}")
+        try:
+            if not self.db.if_token_exist(token):
+                return {"status": "error", "detail": "Невалидный токен"}
+
+            result = self.analysis_manager.delete_analysis(token, analysis_id)
+            return result
+        except Exception as e:
+            logger.error(f"Ошибка при удалении анализа: {e}")
+            return {"status": "error", "detail": str(e)}
+
+    async def get_ai_recommendations(self, token: str, analysis_id: str, if_use_token: bool):
+        if if_use_token:
+            logger.info(f"Запрос AI-рекомендаций для анализа {analysis_id}")
+            try:
+                if not self.db.if_token_exist(token):
+                    return {"status": "error", "detail": "Невалидный токен"}
+
+                analysis_result = self.analysis_manager.get_analysis_by_id(token, analysis_id)
+                if analysis_result.get('status') != 'success':
+                    return analysis_result
+
+                analysis_data = analysis_result['data']
+                average_indices = {}
+                results_per_image = analysis_data.get('results_per_image', [])
+                image_count = len(results_per_image)
+
+                if image_count > 0:
+                    indices_to_process = ['ndvi', 'savi', 'evi', 'vari']
+                    for index_name in indices_to_process:
+                        all_means = [r['statistics'][index_name]['mean'] for r in results_per_image if index_name in r.get('statistics', {})]
+                        if all_means:
+                            average_indices[index_name] = sum(all_means) / len(all_means)
+
+                if not average_indices:
+                    return {"status": "error", "detail": "В данных анализа отсутствуют статистики для расчета средних значений индексов."}
+
+                recommendation = await self.ai_service.get_recommendations(average_indices)
+                return {"status": "success", "recommendation": recommendation, "average_indices": average_indices}
+            except Exception as e:
+                logger.error(f"Ошибка при получении AI-рекомендаций: {e}", exc_info=True)
+                return {"status": "error", "detail": f"Внутренняя ошибка сервера: {e}"}
+        else:
+            recommendation = "AI-рекомендации отключены, так как сервер запущен без токена GigaChat."
+            return {"status": "success", "recommendation": recommendation, "average_indices": []}
+
+    async def save_user_field(self, token: str, field_name: str, area_of_interest: str):
+        """Сохраняет новое поле для пользователя."""
+        logger.info(f"Запрос сохранения поля '{field_name}' для токена {token}")
+        try:
+            if not self.db.if_token_exist(token):
+                return {"status": "error", "detail": "Невалидный токен"}
+
+            try:
+                aoi_data = json.loads(area_of_interest)
+            except json.JSONDecodeError:
+                return {"status": "error", "detail": "Неверный формат area_of_interest"}
+
+            user_data_obj = self._get_user_data_object(token)
+            new_field = {"id": str(int(time.time())), "name": field_name, "area_of_interest": aoi_data}
+            user_data_obj['saved_fields'].insert(0, new_field)
+
+            if self._save_user_data_object(token, user_data_obj):
+                return {"status": "success", "message": "Поле успешно сохранено", "field": new_field}
+            else:
+                return {"status": "error", "detail": "Не удалось сохранить данные"}
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении поля: {e}")
+            return {"status": "error", "detail": f"Внутренняя ошибка сервера: {e}"}
+
+    async def get_historical_ndvi_data(self, token: str, lon: float = None, lat: float = None, radius_km: float = 0.5, polygon_coords: str = None):
+        """Возвращает историю среднего NDVI для области."""
+        logger.info(f"Запрос истории NDVI для токена {token}")
+        
+        if not self.db.if_token_exist(token):
+            return {"status": "error", "detail": "Невалидный токен"}
+
+        try:
+            from gee_initializer import GEEInitializer
+            GEEInitializer.initialize_gee()
+            import ee
+            
+            if polygon_coords:
+                parsed_polygon = json.loads(polygon_coords)
+                area_of_interest = ee.Geometry.Polygon([parsed_polygon])
+            elif lon is not None and lat is not None:
+                point = ee.Geometry.Point([lon, lat])
+                area_of_interest = point.buffer(radius_km * 1000).bounds()
+            else:
+                return {"status": "error", "detail": "Необходимо указать область"}
+
+            import datetime
+            end_date = datetime.date.today()
+            start_date = end_date - datetime.timedelta(days=365*2)
+            
+            historical_data = ImageProvider.get_historical_ndvi(area_of_interest, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
+            return {"status": "success", "data": historical_data}
+        except Exception as e:
+            logger.error(f"Ошибка при получении истории NDVI: {e}")
+            return {"status": "error", "detail": f"Не удалось получить историю: {e}"}
+        
+    async def get_user_fields(self, token: str):
+        """Получает список сохраненных полей пользователя."""
+        logger.info(f"Запрос списка полей для токена {token}")
+        try:
+            if not self.db.if_token_exist(token):
+                return {"status": "error", "detail": "Невалидный токен"}
+
+            user_data_obj = self._get_user_data_object(token)
+            return {"status": "success", "fields": user_data_obj.get('saved_fields', [])}
+        except Exception as e:
+            logger.error(f"Ошибка при получении списка полей: {e}")
+            return {"status": "error", "detail": f"Внутренняя ошибка сервера: {e}"}
+
+    async def delete_user_field(self, token: str, field_id: str):
+        """Удаляет сохраненное поле пользователя по ID."""
+        logger.info(f"Запрос удаления поля ID {field_id} для токена {token}")
+        try:
+            if not self.db.if_token_exist(token):
+                return {"status": "error", "detail": "Невалидный токен"}
+
+            user_data_obj = self._get_user_data_object(token)
+            initial_count = len(user_data_obj['saved_fields'])
+            user_data_obj['saved_fields'] = [field for field in user_data_obj['saved_fields'] if field.get('id') != field_id]
+            
+            if len(user_data_obj['saved_fields']) == initial_count:
+                return {"status": "error", "detail": "Поле с таким ID не найдено"}
+
+            if self._save_user_data_object(token, user_data_obj):
+                return {"status": "success", "message": "Поле успешно удалено"}
+            else:
+                return {"status": "error", "detail": "Не удалось сохранить изменения"}
+        except Exception as e:
+            logger.error(f"Ошибка при удалении поля: {e}")
+            return {"status": "error", "detail": f"Внутренняя ошибка сервера: {e}"}
