@@ -1,235 +1,38 @@
-# --- START OF FILE ImageProvider.py ---
-
-
-import os
-import cv2
-import numpy as np
-import requests
-import ee
-import json
-from typing import List, Dict
-from gee_initializer import GEEInitializer
-
-
-class ImageProvider:
-    CLOUD_FILTER_PERCENTAGE = 0.05
-    # <<< --- НОВОЕ: Константы для визуализации --- >>>
-    VIS_DIMS = 512
-    VIS_PARAMS_RGB = {'bands': ['B4', 'B3', 'B2'], 'min': 0, 'max': 3000}
-    # Используем только один канал B8, GEE вернет серое изображение
-    VIS_PARAMS_NIR = {'bands': ['B8'], 'min': 0, 'max': 3000}
-
-    def __init__(self, rgb_image_path: str = None, nir_image_path: str = None):
-        self.rgb_image, self.red_channel, self.green_channel, self.blue_channel, self.nir_channel = None, None, None, None, None
-        self.cloud_percentage = None
-        if rgb_image_path: 
-            self._load_local_images(rgb_image_path, nir_image_path)
-
-    def _load_local_images(self, rgb_path, nir_path):
-        img_bgr = cv2.imread(rgb_path)
-        self.rgb_image = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        self.red_channel, self.green_channel, self.blue_channel = self.rgb_image[:, :, 0].astype(np.float32), \
-        self.rgb_image[:, :, 1].astype(np.float32), self.rgb_image[:, :, 2].astype(np.float32)
-        if nir_path: 
-            self.nir_channel = cv2.imread(nir_path, cv2.IMREAD_GRAYSCALE).astype(np.float32)
-            self._align_images()
-
-    def _align_images(self):
-        if self.rgb_image is not None and self.nir_channel is not None and self.rgb_image.shape[:2] != self.nir_channel.shape:
-            h, w = self.rgb_image.shape[:2]
-            self.nir_channel = cv2.resize(self.nir_channel, (w, h), interpolation=cv2.INTER_AREA)
-
-    @staticmethod
-    def _url_to_numpy(url: str) -> np.ndarray:
-        try:
-            response = requests.get(url, stream=True)
-            response.raise_for_status()
-            img_array = np.frombuffer(response.content, np.uint8)
-            img_bgr = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-            if img_bgr is None:
-                raise ValueError("cv2.imdecode returned None. Image format may be unsupported or data is corrupt.")
-            return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        except requests.exceptions.RequestException as e:
-            print(f"Error downloading image from URL: {url}. Error: {e}")
-        except Exception as e:
-            print(f"Error processing image from URL: {url}. Error: {e}")
-        return np.zeros((ImageProvider.VIS_DIMS, ImageProvider.VIS_DIMS, 3), dtype=np.uint8)
-
-    @classmethod
-    def _ensure_gee_initialized(cls, service_account_key_path: str = "hack25addcode-3171f61bba2c.json"):
-        if not GEEInitializer.is_initialized():
-            GEEInitializer.initialize_gee(service_account_key_path)
-
-    @classmethod
-    def get_images_from_gee_collection(cls, start_date: str, end_date: str,
-                                       area_of_interest: ee.Geometry,
-                                       service_account_key_path: str = "hack25addcode-3171f61bba2c.json") -> List[Dict]:
-        cls._ensure_gee_initialized(service_account_key_path)
-
-        collection = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-                      .filterBounds(area_of_interest)
-                      .filterDate(start_date, end_date)
-                      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cls.CLOUD_FILTER_PERCENTAGE)))
-
-        image_count = collection.size().getInfo()
-        print(f"Найдено изображений в коллекции (с облачностью < {cls.CLOUD_FILTER_PERCENTAGE}%): {image_count}")
-        if image_count == 0:
-            raise FileNotFoundError(f"Не найдено снимков за указанный период с облачностью менее {cls.CLOUD_FILTER_PERCENTAGE}%. Попробуйте расширить диапазон дат.")
-
-        def get_metadata(image):
-            return ee.Feature(None, {
-                'id': image.get('system:id'),
-                'date': image.date().format('YYYY-MM-dd'),
-                'cloud_percentage': image.get('CLOUDY_PIXEL_PERCENTAGE')
-            })
-
-        print("Получение списка снимков...")
-        metadata_list = collection.map(get_metadata).getInfo()['features']
-
-        processed_images = []
-        stable_bounds = area_of_interest.bounds()
-
-        for metadata in metadata_list:
-            props = metadata['properties']
-            image_id = props['id']
-            date = props['date']
-            cloud_percentage = props['cloud_percentage']
-            
-            print(f"Обработка снимка от {date} (облачность: {cloud_percentage:.2f}%)")
-            
-            try:
-                image = ee.Image(image_id)
-                clipped_image = image.clip(stable_bounds)
-
-                # <<< --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: ЗАМЕНА sampleRectangle НА getThumbURL --- >>>
-                # 1. Получаем RGB изображение для визуализации и каналов R, G, B
-                rgb_params = {**cls.VIS_PARAMS_RGB, 'dimensions': cls.VIS_DIMS}
-                rgb_url = clipped_image.getThumbURL(rgb_params)
-                rgb_image = cls._url_to_numpy(rgb_url)
-
-                # 2. Получаем NIR канал как отдельное серое изображение
-                nir_params = {**cls.VIS_PARAMS_NIR, 'dimensions': cls.VIS_DIMS}
-                nir_url = clipped_image.getThumbURL(nir_params)
-                nir_image_gray = cls._url_to_numpy(nir_url)
-                
-                # 3. Извлекаем каналы из полученных изображений
-                # GEE масштабирует значения каналов в диапазон 0-255 для getThumbURL.
-                # Для вегетационных индексов, которые являются отношениями (ratio),
-                # это не критично и дает корректный результат.
-                red_channel = rgb_image[:, :, 0].astype(np.float32)
-                green_channel = rgb_image[:, :, 1].astype(np.float32)
-                blue_channel = rgb_image[:, :, 2].astype(np.float32)
-                # Для серого изображения все каналы (R,G,B) одинаковы, берем любой
-                nir_channel = nir_image_gray[:, :, 0].astype(np.float32)
-
-                processed_images.append({
-                    'date': date,
-                    'cloud_percentage': cloud_percentage,
-                    'rgb_image': rgb_image, # Это уже готовый numpy array
-                    'red_channel': red_channel,
-                    'green_channel': green_channel,
-                    'blue_channel': blue_channel,
-                    'nir_channel': nir_channel
-                })
-            except Exception as e:
-                print(f"Ошибка при обработке снимка {image_id}: {e}. Пропускаем.")
-        
-        if not processed_images:
-            raise FileNotFoundError("Не удалось обработать ни одного снимка. Возможно, все они содержат ошибки или пусты.")
-            
-        return processed_images
-
-    @classmethod
-    def from_gee(cls, start_date: str, end_date: str,
-                 lon: float = None, lat: float = None, radius_km: float = 0.5,
-                 polygon_coords: List[List[float]] = None,
-                 service_account_key_path: str = "hack25addcode-3171f61bba2c.json"):
-        cls._ensure_gee_initialized(service_account_key_path)
-
-        if polygon_coords:
-            if len(polygon_coords) < 3:
-                raise ValueError("Для полигона необходимо как минимум 3 точки.")
-            area_of_interest = ee.Geometry.Polygon([polygon_coords])
-        elif lon is not None and lat is not None:
-            point = ee.Geometry.Point([lon, lat])
-            area_of_interest = point.buffer(radius_km * 1000).bounds()
-        else:
-            raise ValueError("Необходимо указать либо координаты точки (lon, lat) и радиус, либо координаты полигона.")
-
-        collection = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-                      .filterBounds(area_of_interest)
-                      .filterDate(start_date, end_date)
-                      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cls.CLOUD_FILTER_PERCENTAGE)))
-
-        cleanest_image = ee.Image(collection.sort('CLOUDY_PIXEL_PERCENTAGE').first()).clip(area_of_interest.bounds())
-        
-        try:
-            cloud_percentage = cleanest_image.get('CLOUDY_PIXEL_PERCENTAGE').getInfo()
-        except ee.EEException as e:
-            if 'dictionary is empty' in str(e).lower():
-                 raise FileNotFoundError(f"Не найдено снимков за указанный период с облачностью менее {cls.CLOUD_FILTER_PERCENTAGE}%. Попробуйте расширить диапазон дат.")
-            raise e
-
-        print(f"Выбран самый чистый снимок с облачностью: {cloud_percentage:.2f}%")
-        
-        provider = cls()
-        provider.cloud_percentage = cloud_percentage
-        
-        # <<< --- ИЗМЕНЕНИЕ: Аналогичная замена для этого метода --- >>>
-        # 1. Получаем RGB
-        rgb_params = {**cls.VIS_PARAMS_RGB, 'dimensions': cls.VIS_DIMS * 10} # *10 для лучшего качества одиночного снимка
-        provider.rgb_image = cls._url_to_numpy(cleanest_image.getThumbURL(rgb_params))
-        
-        # 2. Получаем NIR
-        nir_params = {**cls.VIS_PARAMS_NIR, 'dimensions': cls.VIS_DIMS * 10}
-        nir_image_gray = cls._url_to_numpy(cleanest_image.getThumbURL(nir_params))
-        
-        # 3. Извлекаем каналы
-        provider.red_channel = provider.rgb_image[:, :, 0].astype(np.float32)
-        provider.green_channel = provider.rgb_image[:, :, 1].astype(np.float32)
-        provider.blue_channel = provider.rgb_image[:, :, 2].astype(np.float32)
-        provider.nir_channel = nir_image_gray[:, :, 0].astype(np.float32)
-        
-        print("Данные для одного снимка успешно загружены.")
-        return provider
-
-    @classmethod
-    def get_historical_ndvi(cls, area_of_interest: ee.Geometry, start_date: str, end_date: str) -> List[Dict]:
-        cls._ensure_gee_initialized()
-
-        def calculate_monthly_mean(image_collection):
-            years = ee.List.sequence(ee.Date(start_date).get('year'), ee.Date(end_date).get('year'))
-            
-            def process_year(year):
-                def process_month(month):
-                    start = ee.Date.fromYMD(year, month, 1)
-                    end = start.advance(1, 'month')
-                    monthly_collection = image_collection.filterDate(start, end)
-                    cleanest_in_month = monthly_collection.sort('CLOUDY_PIXEL_PERCENTAGE').first()
-                    
-                    def compute_mean(img):
-                        ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI')
-                        mean_dict = ndvi.reduceRegion(
-                            reducer=ee.Reducer.mean(), 
-                            geometry=area_of_interest, 
-                            scale=30, # reduceRegion работает иначе, здесь scale обязателен и не вызывает ошибок
-                            maxPixels=1e9
-                        )
-                        return ee.Feature(None, {
-                            'date': start.format('YYYY-MM-dd'), 
-                            'mean_ndvi': mean_dict.get('NDVI')
-                        })
-                    
-                    return ee.Algorithms.If(cleanest_in_month, compute_mean(ee.Image(cleanest_in_month)), None)
-                
-                months = ee.List.sequence(1, 12)
-                return months.map(process_month)
-            
-            monthly_data = years.map(process_year).flatten()
-            return monthly_data.removeAll([None]).getInfo()
-
-        collection = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-                      .filterBounds(area_of_interest)
-                      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cls.CLOUD_FILTER_PERCENTAGE)))
-        historical_data = calculate_monthly_mean(collection)
-        return historical_data
+| Имя запроса | Метод | Описание | Пример fetch запроса |
+| :--- | :--- | :--- | :--- |
+| Общие и серверные запросы |
+| Проверка здоровья сервера | GET | Проверка работоспособности и доступности сервера. | fetch('/health') |
+| Получение логов (админ) | GET | Просмотр логов сервера (требует пароль администратора). | fetch(/log?password=${encodeURIComponent(password)}) |
+| Получение главной страницы | GET | Загрузка основной HTML страницы приложения. | fetch('/') |
+| Аутентификация и управление пользователями |
+| Получение токена | GET | Аутентификация пользователя и получение токена доступа. | fetch(/get_token?login=${encodeURIComponent(login)}&password=${encodeURIComponent(password)}) |
+| Регистрация пользователя | POST | Создание нового аккаунта с именем и фамилией. | fetch(/add_user?login=${login}&password=${password}&first_name=${fname}&last_name=${lname}, {method: 'POST'}) |
+| Получить всех пользователей (админ) | GET | Получение списка всех зарегистрированных пользователей. | fetch(/users/all?password=${encodeURIComponent(password)}) |
+| Получить профиль пользователя | GET | Получение данных профиля (логин, имя, фамилия) текущего пользователя по его токену. | fetch(/users/profile?token=${token}) |
+| Сохраненные поля (области анализа) |
+| Сохранить поле | POST | Сохраняет текущую область (точку с радиусом или полигон) как именованное поле для быстрого доступа. | const aoi = JSON.stringify({type: 'point_radius', lon: 37.6, lat: 55.7, radius_km: 1}); <br> fetch(/fields/save?token=${token}&field_name=${encodeURIComponent('Центр Москвы')}&area_of_interest=${encodeURIComponent(aoi)}, {method: 'POST'}) |
+| Получить список полей | GET | Возвращает список всех полей, сохраненных пользователем. | fetch(/fields/list?token=${token}) |
+| Удалить поле | DELETE | Удаляет сохраненное поле по его уникальному ID. | fetch(/fields/${fieldId}?token=${token}, {method: 'DELETE'}) |
+| Анализ (рекомендуемый способ) |
+| Выполнить полный анализ | POST | Запускает полный анализ по точке и радиусу ИЛИ по полигону. Сохраняет результат. | // По точке и радиусу <br> fetch(/analysis/perform?token=${token}&start_date=${start}&end_date=${end}&lon=${lon}&lat=${lat}&radius_km=${radius}, {method: 'POST'}) <br><br> // По полигону (координаты - JSON-строка) <br> const poly = JSON.stringify([[lon1, lat1], [lon2, lat2], ...]); <br> fetch(/analysis/perform?token=${token}&start_date=${start}&end_date=${end}&polygon_coords=${encodeURIComponent(poly)}, {method: 'POST'}) |
+| Получить список анализов | GET | Возвращает список всех ранее выполненных анализов для пользователя. | fetch(/analysis/list?token=${token}) |
+| Получить конкретный анализ | GET | Получает полные данные сохраненного анализа по его ID. | fetch(/analysis/${analysisId}?token=${token}) |
+| Удалить анализ | DELETE | Удаляет сохраненный анализ по его ID. | fetch(/analysis/${analysisId}?token=${token}, {method: 'DELETE'}) |
+| Получить AI рекомендации | GET | Получает агрономические рекомендации от GigaChat на основе данных конкретного анализа. | fetch(/analysis/${analysisId}/recommendations?token=${token}) |
+| Получить историю NDVI (таймлайн) | GET | Получает историю среднемесячных значений NDVI для построения графика динамики вегетации. | // По точке и радиусу <br> fetch(/analysis/timeseries?token=${token}&lon=${lon}&lat=${lat}) <br><br> // По полигону (координаты - JSON-строка) <br> const poly = JSON.stringify([[lon1, lat1], ...]); <br> fetch(/analysis/timeseries?token=${token}&polygon_coords=${encodeURIComponent(poly)}) |
+| Пользовательские данные (массив ключей, устаревшие) |
+| Сохранение/создание данных | POST | Сохранение или создание массива ключей для пользователя. | fetch(/savedata?token=${token}&key_array=${encodeURIComponent(keyArray)}, {method: 'POST'}) |
+| Получение данных | GET | Получение сохраненного массива ключей пользователя. | fetch(/givefield?token=${encodeURIComponent(token)}) |
+| Обновление данных | PUT | Полная замена массива ключей на новый. | fetch(/data/update?token=${token}&key_array=${newKeyArray}, {method: 'PUT'}) |
+| Частичное редактирование | PATCH | Добавление или удаление ключей из существующего массива. | fetch(/data/edit?token=${token}&keys_to_add=${keysToAdd}&keys_to_remove=${keysToRemove}, {method: 'PATCH'}) |
+| Проверка существования данных | GET | Проверка, есть ли у пользователя сохраненные данные. | fetch(/data/check?token=${token}) |
+| Удаление данных | DELETE | Удаление всех данных (массива ключей) пользователя. | fetch(/data/delete?token=${token}, {method: 'DELETE'}) |
+| Данные полей (ключ-значение, устаревшие) |
+| Установка данных поля | POST | Установка или обновление данных для произвольного поля (ключа). | fetch(/field/set?field=${field}&data=${data}&token=${token}, {method: 'POST'}) |
+| Получение данных поля | GET | Получение данных по названию поля (ключа). | fetch(/field/get?field=${encodeURIComponent(field)}) |
+| Проверка существования поля | GET | Проверка, существует ли поле с указанным именем. | fetch(/field/check?field=${encodeURIComponent(field)}) |
+| Удаление данных поля | DELETE | Удаление поля и его данных по названию. | fetch(/field/delete?field=${field}&token=${token}, {method: 'DELETE'}) |
+| Получение изображений (устаревшие) |
+| Получение RGB изображения | GET | Получение RGB снимка по геолокации. | fetch(/image/rgb?lon=${lon}&lat=${lat}&start_date=${start}&end_date=${end}&token=${token}) |
+| Получение красного канала | GET | Получение изображения красного канала. | fetch(/image/red-channel?lon=${lon}&lat=${lat}&start_date=${start}&end_date=${end}&token=${token}) |
+| Получение NDVI изображения | GET | Получение NDVI карты растительности. | fetch(/image/ndvi?lon=${lon}&lat=${lat}&start_date=${start}&end_date=${end}&token=${token}) |

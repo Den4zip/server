@@ -1,72 +1,81 @@
-import numpy as np
+# --- START OF FILE gigachat_service.py ---
+import json
+import logging
+from gigachat import GigaChat
+from gigachat.models import Chat, Messages, MessagesRole
 
+logger = logging.getLogger(__name__)
 
-class VegetationIndexCalculator:
-    """
-    Принимает готовые каналы (RGB для визуализации, Red, Green, Blue, NIR для
-    расчетов) и выполняет вычисление и визуализацию индексов.
-    """
-    EPSILON = 1e-8
-    L_SAVI = 0.5 # Коэффициент коррекции почвы для SAVI, стандартное значение
-    # --- НОВЫЕ КОНСТАНТЫ ДЛЯ EVI ---
-    G_EVI = 2.5
-    C1_EVI = 6.0
-    C2_EVI = 7.5
-    L_EVI = 1.0
+class GigaChatService:
+    def __init__(self, config_path="hack25addcode-3171f61bba2c.json"):
+        self.api_key = self._load_api_key(config_path)
+        if not self.api_key:
+            logger.error("Ключ API GigaChat не найден в config.json. Рекомендации AI не будут работать.")
+            self.giga = None
+        else:
+            # verify_ssl_certs=False может понадобиться в некоторых окружениях
+            self.giga = GigaChat(credentials=self.api_key, verify_ssl_certs=False)
 
-    def __init__(self, rgb_image: np.ndarray, red_channel: np.ndarray,
-                 green_channel: np.ndarray, blue_channel: np.ndarray,
-                 nir_channel: np.ndarray = None):
-        """Инициализируется готовыми NumPy массивами."""
-        if rgb_image is None:
-            raise ValueError("RGB изображение (rgb_image) для визуализации должно быть предоставлено.")
-        self.rgb_image = rgb_image
-        self.red_channel = red_channel.astype(np.float32)
-        self.green_channel = green_channel.astype(np.float32)
-        self.blue_channel = blue_channel.astype(np.float32)
-        self.nir_channel = nir_channel.astype(np.float32) if nir_channel is not None else None
+    def _load_api_key(self, config_path):
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                return config.get("GIGACHAT_API_KEY")
+        except FileNotFoundError:
+            logger.warning(f"Файл конфигурации {config_path} не найден.")
+            return None
+        except json.JSONDecodeError:
+            logger.error(f"Ошибка парсинга файла {config_path}.")
+            return None
 
-        self.vari_map = None
-        self.ndvi_map = None
-        self.savi_map = None # Добавлено
-        self.evi_map = None # Добавлено
+    # <<< --- НАЧАЛО ИСПРАВЛЕНИЙ --- >>>
+    async def get_recommendations(self, index_stats: dict) -> str:
+        """
+        Получает агрономические рекомендации от GigaChat на основе средних значений нескольких вегетационных индексов.
+        """
+        if not self.giga:
+            return "Сервис AI-рекомендаций недоступен из-за отсутствия API ключа."
 
-    def calculate_vari(self) -> np.ndarray:
-        """Вычисляет индекс VARI по научным данным каналов."""
-        self.vari_map = ((self.green_channel - self.red_channel) /
-                         (self.green_channel + self.red_channel - self.blue_channel + self.EPSILON))
-        return self.vari_map
+        # Формируем строку с данными для промпта
+        stats_string = "\n".join([f"- {name.upper()}: {value:.3f}" for name, value in index_stats.items()])
 
-    def calculate_ndvi(self) -> np.ndarray:
-        """Вычисляет индекс NDVI, используя научные данные Red и NIR каналов."""
-        if self.nir_channel is None:
-            raise ValueError("Для расчета NDVI необходим NIR канал (nir_channel).")
+        prompt = f"""
+        Ты — ведущий агроном-аналитик, специализирующийся на данных дистанционного зондирования. Тебе предоставлены средние значения нескольких вегетационных индексов для сельскохозяйственного поля.
 
-        self.ndvi_map = ((self.nir_channel - self.red_channel) /
-                         (self.nir_channel + self.red_channel + self.EPSILON))
-        return self.ndvi_map
+        СПРАВКА ПО ИНДЕКСАМ:
+        - NDVI (Normalized Difference Vegetation Index): Основной показатель здоровья и густоты растительности. Высокие значения (ближе к 1) - хорошо.
+        - SAVI (Soil-Adjusted Vegetation Index): Модификация NDVI, которая минимизирует влияние яркости почвы. Особенно полезен на ранних стадиях роста, когда почва видна.
+        - EVI (Enhanced Vegetation Index): Улучшенный индекс, более чувствительный в областях с очень густой растительностью (где NDVI "насыщается") и менее подвержен атмосферным помехам.
+        - VARI (Visible Atmospherically Resistant Index): Индекс, использующий только видимые каналы (RGB). Менее точен, чем индексы с NIR-каналом, но хорошо показывает неоднородность поля и устойчив к атмосферным искажениям.
 
-    # --- НОВЫЙ МЕТОД ---
-    def calculate_savi(self) -> np.ndarray:
-        """Вычисляет индекс SAVI, который корректирует влияние почвы."""
-        if self.nir_channel is None:
-            raise ValueError("Для расчета SAVI необходим NIR канал (nir_channel).")
+        ДАННЫЕ АНАЛИЗА:
+        {stats_string}
 
-        numerator = self.nir_channel - self.red_channel
-        denominator = self.nir_channel + self.red_channel + self.L_SAVI
-        self.savi_map = ((numerator / (denominator + self.EPSILON)) * (1 + self.L_SAVI))
-        return self.savi_map
+        ТВОЯ ЗАДАЧА:
+        1. Проведи комплексный анализ, сравнивая значения индексов между собой. Например, что может означать высокий NDVI, но относительно низкий SAVI? Или как EVI дополняет картину NDVI?
+        2. Дай общую оценку состояния посевов на основе всех данных.
+        3. Сформируй 3-4 конкретные, действенные рекомендации для агронома в виде маркированного списка. Рекомендации должны учитывать нюансы, которые видны из сравнения индексов.
+        4. Ответ должен быть структурированным, лаконичным и профессиональным. Не используй приветствия.
+        """
         
-    # --- НОВЫЙ МЕТОД ---
-    def calculate_evi(self) -> np.ndarray:
-        """Вычисляет улучшенный вегетационный индекс EVI."""
-        if self.nir_channel is None:
-            raise ValueError("Для расчета EVI необходим NIR канал (nir_channel).")
-        
-        # EVI = G * (NIR - Red) / (NIR + C1 * Red - C2 * Blue + L)
-        numerator = self.nir_channel - self.red_channel
-        denominator = (self.nir_channel + self.C1_EVI * self.red_channel - 
-                       self.C2_EVI * self.blue_channel + self.L_EVI)
-        
-        self.evi_map = self.G_EVI * (numerator / (denominator + self.EPSILON))
-        return self.evi_map
+        payload = Chat(
+            messages=[
+                Messages(
+                    role=MessagesRole.USER,
+                    content=prompt
+                )
+            ],
+            temperature=0.7,
+        )
+
+        try:
+            logger.info(f"Отправка запроса в GigaChat с данными: {index_stats}")
+            # ИСПРАВЛЕНИЕ: Убран 'async with'. Вызываем achat напрямую.
+            response = await self.giga.achat(payload)
+            recommendation = response.choices[0].message.content
+            logger.info("Ответ от GigaChat успешно получен.")
+            return recommendation
+        except Exception as e:
+            logger.error(f"Ошибка при взаимодействии с API GigaChat: {e}")
+            return f"Не удалось получить AI-рекомендации. Ошибка: {e}"
+    # <<< --- КОНЕЦ ИСПРАВЛЕНИЙ --- >>>

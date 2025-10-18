@@ -1,0 +1,9 @@
+uvicorn
+fastapi
+pillow
+opencv-python
+pillow
+requests
+numpy
+earthengine-api
+gigachat
